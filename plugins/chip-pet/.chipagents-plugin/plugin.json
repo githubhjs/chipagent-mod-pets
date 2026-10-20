@@ -1,0 +1,4 @@
+{
+  "name": "chip-pet",
+  "hooks": "./hooks/hooks.toml"
+}

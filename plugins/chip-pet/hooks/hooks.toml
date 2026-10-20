@@ -1,0 +1,66 @@
+# chip-pet hooks for ChipAgents.
+#
+# Every hook calls `chip-pet event <name>`, which only records the event for
+# the pet: it prints nothing, never blocks and always exits 0, so the agent's
+# context and token use stay exactly as they were. Watch the pet with
+# `chip-pet watch` (or `chip-pet tmux`) in another pane.
+#
+# add_to_context = false and hide_from_ui = true are set where the ChipAgents
+# docs list them (runtime hooks and startup). The hook prints nothing anyway,
+# so add_to_context only documents the intent; on pre_turn it also keeps the
+# hook out of the "temporary hook context" warning for preserved thinking.
+#
+# Deliberately NOT set here: post_turn_restarts. The first value found while
+# loading wins, so a value in a plugin could silently replace your budget.
+# Not used: post_edit (measured unreliable on 0.42.3).
+
+[[startup]]
+type = "bash"
+command = 'bash "${CHIPAGENTS_PLUGIN_ROOT}/bin/chip-pet" event startup'
+timeout = 10
+hide_from_ui = true
+
+[[pre_turn]]
+type = "bash"
+command = 'bash "${CHIPAGENTS_PLUGIN_ROOT}/bin/chip-pet" event pre_turn'
+timeout = 5
+add_to_context = false
+hide_from_ui = true
+
+[[pre_tool_use]]
+type = "bash"
+command = 'bash "${CHIPAGENTS_PLUGIN_ROOT}/bin/chip-pet" event pre_tool_use'
+timeout = 5
+add_to_context = false
+hide_from_ui = true
+
+[[post_tool_use]]
+type = "bash"
+command = 'bash "${CHIPAGENTS_PLUGIN_ROOT}/bin/chip-pet" event post_tool_use'
+timeout = 10
+add_to_context = false
+hide_from_ui = true
+
+[[post_compact]]
+type = "bash"
+command = 'bash "${CHIPAGENTS_PLUGIN_ROOT}/bin/chip-pet" event post_compact'
+timeout = 5
+add_to_context = false
+hide_from_ui = true
+
+[[post_turn]]
+type = "bash"
+command = 'bash "${CHIPAGENTS_PLUGIN_ROOT}/bin/chip-pet" event post_turn'
+timeout = 5
+add_to_context = false
+hide_from_ui = true
+
+[[end_turn]]
+type = "bash"
+command = 'bash "${CHIPAGENTS_PLUGIN_ROOT}/bin/chip-pet" event end_turn'
+timeout = 5
+
+[[shutdown]]
+type = "bash"
+command = 'bash "${CHIPAGENTS_PLUGIN_ROOT}/bin/chip-pet" event shutdown'
+timeout = 5

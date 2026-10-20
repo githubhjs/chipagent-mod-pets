@@ -1,0 +1,12 @@
+{
+  "name": "chip-pet",
+  "version": "1.0.0",
+  "description": "A zero-token terminal pet for ChipAgents. Silent hooks record what the agent does (simulation, lint, synthesis, git, pass/fail); `chip-pet watch` animates an ASCII pet in a tmux pane. /pet shows or pets it.",
+  "author": {
+    "name": "Josh_HUANG",
+    "email": "HuangJS@Gmail.com"
+  },
+  "license": "MIT",
+  "repository": "https://github.com/githubhjs/chipagent-mod-pets",
+  "keywords": ["chipagents", "pet", "tamagotchi", "ascii", "animation", "tmux"]
+}

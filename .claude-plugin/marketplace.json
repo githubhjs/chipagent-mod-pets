@@ -1,0 +1,22 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "chip-pets",
+  "description": "Pets and animations for ChipAgents (--type claude): a zero-token ASCII pet that reacts to simulation, lint, synthesis and git",
+  "owner": {
+    "name": "Josh_HUANG",
+    "email": "HuangJS@Gmail.com"
+  },
+  "plugins": [
+    {
+      "name": "chip-pet",
+      "description": "A zero-token terminal pet for ChipAgents. Silent hooks record what the agent does; `chip-pet watch` animates an ASCII pet in a tmux pane; /pet shows or pets it.",
+      "version": "1.0.0",
+      "author": {
+        "name": "Josh_HUANG",
+        "email": "HuangJS@Gmail.com"
+      },
+      "source": "./plugins/chip-pet",
+      "category": "fun"
+    }
+  ]
+}

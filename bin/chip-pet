@@ -1,0 +1,5 @@
+#!/bin/bash
+# Put this directory on PATH (or symlink this file into ~/bin) to get the
+# `chip-pet` command; it runs the copy inside the plugin.
+here=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
+exec bash "$here/../plugins/chip-pet/bin/chip-pet" "$@"

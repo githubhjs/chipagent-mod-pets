@@ -1,0 +1,1118 @@
+#!/bin/bash
+
+# chip-pet: a terminal pet that watches ChipAgents work.
+#
+# ChipAgents has no status line, and what a hook prints can be added to the
+# agent's context, so the pet is split in two:
+#
+#   chip-pet event <name>   called by the plugin's hooks. Records the event in
+#                           a small state file, prints NOTHING, never blocks
+#                           and always exits 0: the agent never sees it and
+#                           no token is spent.
+#   chip-pet watch          runs in a tmux pane or a second terminal and
+#                           animates the pet from that state file.
+#
+# Pure bash 4.2+ and coreutils: no jq, python, node or bun.
+#
+# Author: Chih-Hsueh "Josh" HUANG <HuangJS@Gmail.com>. License: MIT.
+
+set -u
+
+CHIP_PET_VERSION=1.0.0
+# No forks here: hooks run this on every tool call.
+SELF=${BASH_SOURCE[0]}
+[[ $SELF == /* ]] || SELF=$PWD/$SELF
+PET_HOME=${CHIP_PET_HOME:-${CHIPAGENTS_HOME:-$HOME/.chipagents}/pet}
+STATE=$PET_HOME/state
+HATCH_XP=20
+
+declare -A S=()
+
+# ------------------------------------------------------------------ state ---
+
+load_state() {
+  S=()
+  [[ -f $STATE ]] || return 0
+  local k v
+  while IFS='=' read -r k v; do
+    [[ $k =~ ^[a-z_]+$ ]] && S[$k]=$v
+  done < "$STATE"
+}
+
+# Atomic replace: the viewer reads the file without the lock.
+save_state() {
+  local tmp=$STATE.tmp.$$ k
+  {
+    for k in "${!S[@]}"; do
+      printf '%s=%s\n' "$k" "${S[$k]}"
+    done
+  } > "$tmp" && mv -f "$tmp" "$STATE"
+}
+
+# num KEY VAR: the numeric value of S[KEY] (0 if unset or not a number)
+# into VAR. The local has an unusual name so it cannot shadow VAR.
+num() {
+  local _num_v=${S[$1]:-0}
+  [[ $_num_v =~ ^[0-9]+$ ]] || _num_v=0
+  printf -v "$2" '%s' "$_num_v"
+}
+
+inc() {
+  local v
+  num "$1" v
+  S[$1]=$((v + ${2:-1}))
+}
+
+now_s() { printf -v "$1" '%(%s)T' -1; }
+
+# Names come from the user: drop control characters, keep it short.
+clean_name() {
+  local s=${1//[[:cntrl:]]/}
+  s=${s//=/}
+  printf '%s' "${s:0:24}"
+}
+
+# Run "$@" while holding the state lock. Give up after about 2 s: losing one
+# event is better than stalling the agent.
+with_lock() {
+  mkdir -p "$PET_HOME" 2> /dev/null || return 1
+  local rc
+  if [[ ${CHIP_PET_LOCK:-} != mkdir ]] && command -v flock > /dev/null 2>&1; then
+    local fd
+    exec {fd}>> "$PET_HOME/.lock" || return 1
+    if ! flock -w 2 "$fd"; then
+      exec {fd}>&-
+      return 1
+    fi
+    "$@"
+    rc=$?
+    exec {fd}>&-
+    return $rc
+  fi
+  local lock=$PET_HOME/.lock.d i=0
+  until mkdir "$lock" 2> /dev/null; do
+    # A holder killed by the hook timeout leaves the directory behind.
+    if ((i % 50 == 49)) && [[ -n $(find "$lock" -maxdepth 0 -mmin +0.1 2> /dev/null) ]]; then
+      rmdir "$lock" 2> /dev/null
+    fi
+    ((++i > 200)) && return 1
+    sleep 0.01
+  done
+  "$@"
+  rc=$?
+  rmdir "$lock" 2> /dev/null
+  return $rc
+}
+
+# --------------------------------------------------------------- species ---
+
+SPECIES=(chip cat owl ghost bot frog)
+
+# Sets ART (4 lines with {L} {R} eyes and {M} mouth), ALT_I/ALT (one line
+# swapped on odd idle frames), COLOR and DEFNAME. Original art, MIT.
+set_species() {
+  ALT_I=-1 ALT=
+  case $1 in
+    cat)
+      ART=('  /\_/\' ' ( {L} {R} )' ' =\ {M} /=' '  (___)~')
+      ALT_I=3 ALT='  (___)_/' COLOR=33 DEFNAME=Clocky
+      ;;
+    owl)
+      ART=('  /\___/\' ' ( ({L})({R}) )' '  \  {M}  /' '   ^^ ^^')
+      COLOR=35 DEFNAME=Lintie
+      ;;
+    ghost)
+      ART=('   .---.' '  / {L} {R} \' '  |  {M}  |' '  ^v^v^v^')
+      ALT_I=3 ALT='  v^v^v^v' COLOR=37 DEFNAME=Xavier
+      ;;
+    bot)
+      ART=('     *' '   .-|-.' '  [ {L}{M}{R} ]' "   '-^-'")
+      ALT_I=0 ALT='     o' COLOR=36 DEFNAME=Testy
+      ;;
+    frog)
+      ART=('   _   _' '  ({L})_({R})' ' (   {M}   )' '  ^^   ^^')
+      COLOR=32 DEFNAME=Flop
+      ;;
+    *)
+      ART=('  .n.n.n.n.' ' =|{L}    {R}|=' ' =|  {M}   |=' "  'u'u'u'u'")
+      COLOR=92 DEFNAME=Dippy
+      ;;
+  esac
+}
+
+is_species() {
+  local s
+  for s in "${SPECIES[@]}"; do
+    [[ $s == "$1" ]] && return 0
+  done
+  return 1
+}
+
+# The first pet is chosen from the user name, so it is stable per user.
+default_species() {
+  local h
+  h=$(printf '%s' "${USER:-${USERNAME:-pet}}" | cksum)
+  h=${h%% *}
+  printf '%s' "${SPECIES[h % ${#SPECIES[@]}]}"
+}
+
+ensure_pet() {
+  local now
+  now_s now
+  if ! is_species "${S[species]:-}"; then
+    S[species]=$(default_species)
+  fi
+  set_species "${S[species]}"
+  [[ -n ${S[name]:-} ]] || S[name]=$DEFNAME
+  [[ ${S[born]:-} =~ ^[0-9]+$ ]] || S[born]=$now
+  [[ ${S[last_fed]:-} =~ ^[0-9]+$ ]] || S[last_fed]=$now
+}
+
+# Level L needs 25*L*L xp. Before HATCH_XP the pet is an egg.
+level_of() {
+  local xp=$1
+  LEVEL=0
+  while ((25 * (LEVEL + 1) * (LEVEL + 1) <= xp)); do
+    ((LEVEL++))
+  done
+  LV_BASE=$((25 * LEVEL * LEVEL))
+  LV_NEXT=$((25 * (LEVEL + 1) * (LEVEL + 1)))
+  if ((xp < HATCH_XP)); then
+    STAGE=egg
+  elif ((LEVEL < 3)); then
+    STAGE=baby
+  elif ((LEVEL < 6)); then
+    STAGE=teen
+  else
+    STAGE=adult
+  fi
+}
+
+# ---------------------------------------------------------------- events ---
+
+# Tool names first; generic words ("cd sim", "make test") only when no tool
+# name matched, so "cd sim && xrun" is xrun and not a directory called sim.
+declare -A PAT=(
+  [lint]='(^|[^a-z0-9_.-])(slang|verible-verilog-lint|verible|spyglass|sg_shell|ascentlint|hal)([^a-z0-9_]|$)'
+  [formal]='(^|[^a-z0-9_.-])(jg|jaspergold|vcf|sby|symbiyosys|fm_shell|formality|lec)([^a-z0-9_]|$)'
+  [synth]='(^|[^a-z0-9_.-])(dc_shell|fc_shell|genus|yosys|vivado|quartus_sh)([^a-z0-9_]|$)'
+  [wave]='(^|[^a-z0-9_.-])(verdi|simvision|gtkwave|nwave)([^a-z0-9_]|$)'
+  [sim]='(^|[^a-z0-9_.-])(xrun|irun|ncsim|vcs|simv|vsim|vlog|qrun|questa|verilator|iverilog|vvp|xsim|xelab|xvlog|dsim|riviera)([^a-z0-9_]|$)'
+  [git]='(^|[^a-z0-9_.-])(git-flock-autocommit|git-flock-commit|git-flock|git)([^a-z0-9_]|$)'
+  [test]='(^|[^a-z0-9_.-])(pytest|ctest|selftest|verify\.sh)([^a-z0-9_]|$)'
+)
+# Second pass. build comes last: "make sim" is a simulation.
+declare -A GENERIC=(
+  [lint]='(^|[^a-z0-9_.-])(lint)([^a-z0-9_]|$)'
+  [synth]='(^|[^a-z0-9_.-])(synth|synthesis)([^a-z0-9_]|$)'
+  [sim]='(^|[^a-z0-9_.-])(sim|run_sim|runsim|regress|regression)([^a-z0-9_]|$)'
+  [test]='(^|[^a-z0-9_.-])(test|tests)([^a-z0-9_]|$)'
+  [build]='(^|[^a-z0-9_.-])(make|gmake|cmake|ninja|gcc|g\+\+|clang|cargo|bazel)([^a-z0-9_]|$)'
+)
+PAT_ORDER=(lint formal synth wave sim git test build)
+
+# Heuristic verdicts on a shell command's output (post_tool_use). Override
+# with CHIP_PET_FAIL_RE / CHIP_PET_PASS_RE (bash ERE). Failure wins.
+FAIL_RE=${CHIP_PET_FAIL_RE:-'UVM_(FATAL|ERROR)[[:space:]]*:[[:space:]]*[1-9]|Error-\[|%Error|\*[EF],[A-Z]+|TEST(CASE)?[ _]?FAIL|[1-9][0-9]* (tests? )?failed|[Ss]egmentation fault|Traceback \(most recent call last\)|command not found'}
+PASS_RE=${CHIP_PET_PASS_RE:-'TEST(CASE)?[ _]?PASS|UVM_ERROR[[:space:]]*:[[:space:]]*0([^0-9]|$)|[Aa]ll [0-9]* *tests? passed|[0-9]+ passed|PASSED'}
+
+classify_command() {
+  local c=${1,,} k
+  KIND=shell PROG=
+  if [[ $c == *verilator* && $c == *--lint-only* ]]; then
+    KIND=lint PROG=verilator
+    return
+  fi
+  for k in "${PAT_ORDER[@]}"; do
+    if [[ -n ${PAT[$k]:-} && $c =~ ${PAT[$k]} ]]; then
+      KIND=$k PROG=${BASH_REMATCH[2]}
+      return
+    fi
+  done
+  for k in "${PAT_ORDER[@]}"; do
+    if [[ -n ${GENERIC[$k]:-} && $c =~ ${GENERIC[$k]} ]]; then
+      KIND=$k PROG=${BASH_REMATCH[2]}
+      return
+    fi
+  done
+  c=${c#"${c%%[![:space:]]*}"}
+  PROG=${c%%[[:space:]]*}
+  PROG=${PROG##*/}
+}
+
+classify_tool() {
+  local tool=${1,,}
+  case $tool in
+    bash | shell | run* | terminal | exec*) classify_command "$2" ;;
+    *wave*) KIND=wave PROG=$1 ;;
+    *edit* | *write* | *replace* | *patch* | create* | *insert*) KIND=edit PROG=$1 ;;
+    read* | *grep* | glob* | *search* | list* | ls | find* | view* | open* | fetch*) KIND=read PROG=$1 ;;
+    git*) KIND=git PROG=git ;;
+    task | agent | *subagent* | dispatch*) KIND=sub PROG=$1 ;;
+    *) KIND=other PROG=$1 ;;
+  esac
+  PROG=${PROG//[^A-Za-z0-9_.+-]/}
+  PROG=${PROG:0:20}
+}
+
+# First "key": "value" in the payload, without a JSON parser.
+json_field() {
+  local re='"'$1'"[[:space:]]*:[[:space:]]*"(([^"\\]|\\.)*)"'
+  [[ $2 =~ $re ]] && printf '%s' "${BASH_REMATCH[1]}"
+}
+
+inner_run() { [[ -n ${CHIPAGENTS_HOOKS_INNER:-}${REVIEW_GATE_INNER:-} ]]; }
+
+# Called under the lock: fold one event into the state.
+apply_event() {
+  local ev=$1 kind=${2:-} prog=${3:-} verdict=${4:-} now
+  now_s now
+  load_state
+  ensure_pet
+  S[last_ts]=$now
+  case $ev in
+    startup)
+      S[last_event]=hello
+      ;;
+    pre_turn)
+      S[last_event]=think
+      ;;
+    pre_tool_use)
+      S[last_event]=tool S[last_kind]=$kind S[last_prog]=$prog
+      inc tools
+      inc xp
+      case $kind in
+        sim | test) inc sims ;;
+        lint) inc lints ;;
+        synth) inc synths ;;
+        formal) inc formals ;;
+        git) inc gits ;;
+        edit) inc edits ;;
+      esac
+      ;;
+    post_tool_use)
+      # The tool returned; the model is reading its output.
+      S[last_event]=think
+      case $verdict in
+        fail)
+          S[last_event]=fail
+          inc fails
+          ;;
+        pass)
+          S[last_event]=pass S[last_fed]=$now
+          inc passes
+          inc xp 10
+          ;;
+      esac
+      ;;
+    post_turn)
+      S[last_event]=turn
+      inc turns
+      inc xp 2
+      ;;
+    end_turn)
+      S[last_event]=done
+      inc dones
+      inc xp 5
+      ;;
+    pre_compact | post_compact)
+      S[last_event]=compact
+      inc compacts
+      ;;
+    shutdown)
+      S[last_event]=bye
+      ;;
+    review)
+      S[last_event]=review S[last_prog]=$prog
+      ;;
+    pet)
+      S[last_event]=petted
+      inc pets
+      ;;
+    feed)
+      S[last_event]=fed S[last_fed]=$now
+      inc feeds
+      ;;
+  esac
+  [[ $ev == pet || $ev == feed ]] || S[project]=${PWD##*/}
+  S[project]=${S[project]//[[:cntrl:]=]/}
+  save_state
+}
+
+cmd_event() {
+  local ev=${1:-unknown} head= tail= tool= cmd= verdict=
+  # Drain stdin in every path, so ChipAgents never writes into a closed pipe.
+  # Keep only both ends: compile errors come first and the UVM summary comes
+  # last, and a multi-megabyte log stays fast to scan.
+  if [[ ! -t 0 ]]; then
+    head=$(head -c 65536 2> /dev/null)
+    tail=$(tail -c 65536 2> /dev/null)
+  fi
+  [[ -n ${CHIP_PET_OFF:-} ]] && return 0
+  KIND= PROG=
+  case $ev in
+    pre_tool_use | post_tool_use)
+      tool=$(json_field tool_name "$head") || tool=$(json_field tool_name "$tail")
+      cmd=$(json_field command "$head")
+      # tool_input may arrive JSON-encoded as a string; then classify on the
+      # head of the payload (before the call there is no tool_output in it).
+      [[ -z $cmd && $ev == pre_tool_use ]] && cmd=${head:0:2000}
+      classify_tool "${tool:-unknown}" "$cmd"
+      if [[ $ev == post_tool_use && $KIND != edit && $KIND != read ]]; then
+        if [[ "$head $tail" =~ $FAIL_RE ]]; then
+          verdict=fail
+        elif [[ "$head $tail" =~ $PASS_RE ]]; then
+          verdict=pass
+        fi
+      fi
+      ;;
+  esac
+  # Read-only inner runs (review-gate's reviewer, chip-swarm investigators)
+  # animate the pet as a reviewer but earn nothing, and their turn ends
+  # neither celebrate nor ring the bell.
+  if inner_run; then
+    case $ev in
+      pre_tool_use) with_lock apply_event review "" "$PROG" ;;
+    esac
+    return 0
+  fi
+  if [[ $ev == startup ]]; then
+    record_plugin_root
+    maybe_tmux_pane
+  fi
+  with_lock apply_event "$ev" "$KIND" "$PROG" "$verdict"
+}
+
+# Lets the /pet command find this script, wherever the plugin was installed.
+record_plugin_root() {
+  local root=${CHIPAGENTS_PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}
+  [[ -n $root && -f $root/bin/chip-pet ]] || return 0
+  mkdir -p "$PET_HOME" && printf '%s\n' "$root" > "$PET_HOME/plugin_root"
+}
+
+# Opt-in (CHIP_PET_TMUX=1): open the viewer in a side pane when ChipAgents
+# starts inside tmux, unless this window already has one.
+maybe_tmux_pane() {
+  [[ ${CHIP_PET_TMUX:-} == 1 && -n ${TMUX:-} && -n ${TMUX_PANE:-} ]] || return 0
+  command -v tmux > /dev/null 2>&1 || return 0
+  if tmux list-panes -t "$TMUX_PANE" -F '#{pane_title} #{pane_start_command}' 2> /dev/null | grep -q chip-pet; then
+    return 0
+  fi
+  tmux split-window -d -h -l "${CHIP_PET_PANE_WIDTH:-40}" -t "$TMUX_PANE" "bash '$SELF' watch" 2> /dev/null
+  return 0
+}
+
+# --------------------------------------------------------------- display ---
+
+utf8() {
+  [[ -z ${CHIP_PET_ASCII:-} ]] || return 1
+  local l=${LC_ALL:-${LC_CTYPE:-${LANG:-}}}
+  [[ ${l,,} == *utf-8* || ${l,,} == *utf8* ]]
+}
+
+lang_zh() {
+  local l=${CHIP_PET_LANG:-${LC_ALL:-${LANG:-}}}
+  [[ $l == zh_TW* || $l == zh-TW* || $l == zh_Hant* ]]
+}
+
+# The face for a mood: L R eyes, M mouth.
+face() {
+  case $1 in
+    think | sub) L=o R=O M=. ;;
+    work) L=o R=o M== ;;
+    sim | wave) L=O R=O M=o ;;
+    lint | review) L=o R=O M=_ ;;
+    synth | formal) L=o R=o M='~' ;;
+    git | hello | bye | fed) L=^ R=^ M=o ;;
+    pass | done | hatch | levelup | petted) L=^ R=^ M=v ;;
+    fail) L=O R=O M=n ;;
+    compact) L=@ R=@ M='~' ;;
+    sleep) L=- R=- M=. ;;
+    hungry) L=u R=u M='~' ;;
+    *) L=o R=o M=_ ;;
+  esac
+}
+
+# Props: up to 4 animated lines drawn to the right of the pet.
+props() {
+  local m=$1 t=$2 sp='                    '
+  P=('' '' '' '')
+  case $m in
+    think | sub)
+      ((t % 6 >= 4)) && P[0]='     ( ? )'
+      ((t % 6 >= 2)) && P[1]='   o'
+      P[2]=' .'
+      [[ $m == sub ]] && P[3]=' subagent'
+      ;;
+    work)
+      local k=(tap tik tak tok)
+      P[0]="  ${k[t % 4]}"
+      P[2]=' _________'
+      if ((t % 2)); then P[3]='|_=_=_=_=|'; else P[3]='|=_=_=_=_|'; fi
+      ;;
+    read)
+      local x=$((t % 6))
+      P[1]="${sp:0:x} .-."
+      P[2]="${sp:0:x}(   )"
+      P[3]="${sp:0:x} '-'\\"
+      ;;
+    sim | wave)
+      local hi=- clk dat
+      utf8 && hi=‾
+      clk="_|${hi}|_|${hi}|_|${hi}|_|${hi}|_|${hi}|_|${hi}|_|${hi}|"
+      dat="${hi}${hi}${hi}\\___/${hi}\\_____/${hi}${hi}${hi}${hi}${hi}\\___/${hi}\\_____/${hi}${hi}"
+      P[0]="clk ${clk:t % 4:14}"
+      P[1]="dat ${dat:t % 18:14}"
+      if [[ $m == sim ]]; then P[3]="@ $((t * 10)) ns"; else P[3]="zoom $((t % 5 + 1))x"; fi
+      ;;
+    lint)
+      local text='always_ff @(posedge' x=$((t % 19))
+      P[1]=" $text"
+      P[2]=" ${sp:0:x}^"
+      P[3]=' ~~ lint ~~'
+      ;;
+    synth | formal)
+      local g=('|' '/' '-' '\')
+      P[1]="  .-.   .-."
+      P[2]=" ( ${g[t % 4]} )=( ${g[(t + 2) % 4]} )"
+      P[3]="  '-'   '-'"
+      if [[ $m == synth ]]; then P[0]=' [&]-[|]->'; else P[0]=' prove...'; fi
+      ;;
+    git)
+      local n=$((t % 5 + 1)) chain=o i
+      for ((i = 1; i < n; i++)); do chain+='--o'; done
+      P[2]=" $chain"
+      P[3]=' commit'
+      ;;
+    pass | done | hatch | levelup)
+      if ((t % 2)); then
+        P[0]='  *    .   +' P[1]=' .   +   *' P[2]='   +   .'
+      else
+        P[0]=' .   *    .' P[1]='  +   .   +' P[2]=' *   +    .'
+      fi
+      case $m in
+        pass) P[3]=' PASS!' ;;
+        done) P[3]=' done!' ;;
+        hatch) P[3]=' hatched!' ;;
+        levelup) P[3]=' level up!' ;;
+      esac
+      ;;
+    fail)
+      if ((t % 2)); then P[0]='  !  !'; else P[0]=' !  !  !'; fi
+      P[2]=" ${PROG:-it} failed?"
+      P[3]=' read the 1st error'
+      ;;
+    sleep)
+      ((t % 8 >= 6)) && P[0]='      Z'
+      ((t % 8 >= 4)) && P[1]='    z'
+      ((t % 8 >= 2)) && P[2]='  z'
+      ;;
+    review)
+      P[1]='  .-.'
+      P[2]=' ( o )'
+      P[3]="  '-'\\ reviewer"
+      ;;
+    compact)
+      local s=('@' '~' '%' '&')
+      P[1]="  ${s[t % 4]}${s[(t + 1) % 4]}${s[(t + 2) % 4]}"
+      P[2]=' squish!'
+      ;;
+    petted)
+      local h='<3'
+      utf8 && h=♥
+      P[2 - t % 3]="   $h"
+      ;;
+    fed)
+      if ((t % 2)); then P[2]='  nom'; else P[2]='  nom nom'; fi
+      P[3]=' [0101]'
+      ;;
+    hungry)
+      P[2]='  ...food?'
+      ;;
+    hello | bye)
+      if ((t % 2)); then P[1]='  o/'; else P[1]='  o_'; fi
+      if [[ $m == hello ]]; then P[2]=' hi!'; else P[2]=' bye!'; fi
+      ;;
+  esac
+}
+
+# The pet's 4 art lines for a mood and frame, into A.
+pet_art() {
+  local m=$1 t=$2 i line xp
+  A=()
+  num xp xp
+  if [[ $m == egg ]]; then
+    local mid='  /    \' low=' |      |'
+    ((xp >= 8)) && mid='  / ,  \'
+    ((xp >= 15)) && mid='  / /\ \' low=' |  \/  |'
+    A=('   .--.' "$mid" "$low" "  '----'")
+    # Wobble while ChipAgents is busy.
+    local age=$((NOW - ${S[last_ts]:-0}))
+    if ((age < 5 && t % 2)); then
+      for i in 0 1 2 3; do A[i]=" ${A[i]}"; done
+    fi
+    return
+  fi
+  face "$m"
+  # Blink now and then while calm.
+  if [[ $m == idle || $m == read || $m == work ]] && ((t % 20 == 0)); then
+    L=- R=-
+  fi
+  for i in 0 1 2 3; do
+    line=${ART[i]}
+    ((i == ALT_I && t % 2)) && line=$ALT
+    line=${line//\{L\}/$L}
+    line=${line//\{R\}/$R}
+    line=${line//\{M\}/$M}
+    A[i]=$line
+  done
+}
+
+# Display width of a string: ASCII is 1 column, CJK 2. Approximation: a
+# 3-byte UTF-8 character counts 2, except the few narrow symbols used here.
+str_width() {
+  local s=$1 chars bytes n2 n3
+  chars=${#s}
+  n2=${s//[^·]/}
+  n3=${s//[^‾♥✓✗]/}
+  n2=${#n2} n3=${#n3}
+  local LC_ALL=C
+  bytes=${#s}
+  printf -v "$2" '%s' $((chars + (bytes - chars - n2) / 2 - n3))
+}
+
+# Word-wrap $1 to $2 columns into WRAP (CJK text breaks anywhere).
+wrap_text() {
+  local text=$1 width=$2 line= word w lw
+  WRAP=()
+  for word in $text; do
+    str_width "$word" w
+    while ((w > width)); do
+      # A word longer than the line (CJK runs): break it by characters.
+      local part= c pw=0 cw
+      while [[ -n $word ]]; do
+        c=${word:0:1}
+        str_width "$c" cw
+        ((pw + cw > width)) && break
+        part+=$c
+        ((pw += cw))
+        word=${word:1}
+      done
+      [[ -n $line ]] && WRAP+=("$line") && line=
+      WRAP+=("$part")
+      str_width "$word" w
+    done
+    [[ -z $word ]] && continue
+    str_width "$line" lw
+    if [[ -z $line ]]; then
+      line=$word
+    elif ((lw + 1 + w <= width)); then
+      line+=" $word"
+    else
+      WRAP+=("$line")
+      line=$word
+    fi
+  done
+  [[ -n $line ]] && WRAP+=("$line")
+}
+
+pad_to() {
+  local w
+  str_width "$1" w
+  local n=$(($2 - w))
+  ((n < 0)) && n=0
+  printf -v "$3" '%s%*s' "$1" "$n" ''
+}
+
+# ------------------------------------------------------------- messages ---
+
+msg_pool() {
+  local m=$1
+  MSGS=()
+  if lang_zh; then
+    case $m in
+      idle) MSGS=('待命中。時脈閒置,功耗很低。' '有 RTL 要給我看嗎?' '這裡沒有 timing violation。' '我被 clock gating 了,需要我就叫我。' '冷知識:latch 就是一顆沒學會等待的 flop。' 'reset 已拉起,隨時可以開工。') ;;
+      think) MSGS=('思考中...訊號正在穿過組合邏輯雲。' '嗯,我追一下這條訊號。' '在讀 spec 的字裡行間。' '規劃下一步。') ;;
+      sub) MSGS=('subagent 出動了,我在旁邊看著。' '分頭進行中,等報告回來。') ;;
+      work) MSGS=('改東西中。保證只用 non-blocking assignment。' '以 1 GHz 打字中。' '正在修改,reset 先別放。' '{prog} 跑著呢。') ;;
+      read) MSGS=('讀程式中,一行都不放過。' 'grep 找線索中。' '原來 reset 是接到這裡。') ;;
+      sim) MSGS=('{prog} 跑起來了,看波形捲過去。' '模擬中...裡面的時間比外面快。' '拜託,UVM_ERROR : 0,拜託...' 'seed 是隨機的,我的期待是確定的。' '去倒杯咖啡吧,模擬器不趕時間。') ;;
+      wave) MSGS=('開波形中。放大、縮小、再放大。' '這個 glitch 是真的還是我眼花?') ;;
+      lint) MSGS=('lint 中。寬度不符的,給我出來。' '{prog} 正在看每一個 always block。' '抓 inferred latch 中。') ;;
+      synth) MSGS=('合成中。把想法變成邏輯閘。' '{prog} 在 mapping,NAND 不客氣。' '數閘數、祈禱還有 slack。') ;;
+      formal) MSGS=('formal 正在證明...或找反例。' '對所有輸入...嗯,輸入有點多。') ;;
+      git) MSGS=('commit 中。整齊的歷史才是快樂的歷史。' 'git 跟你打招呼。') ;;
+      pass) MSGS=('PASS!我最喜歡的字。' '乾淨的一輪!通過的測試是我最愛的點心。' '全綠。我在跳小舞。') ;;
+      fail) MSGS=('糟糕,有東西失敗了。先看第一個錯誤,不是最後一個。' '紅字!別慌,X 難免的。' '失敗只是 bug 在跟你打招呼。' '先查 reset 跟 seed。') ;;
+      review) MSGS=('reviewer 正在看 diff,祈禱中。' '同儕審查進行中,快把 TODO 藏起來。') ;;
+      done) MSGS=('這一輪完成!換你了。' '做完了,還要檢查什麼嗎?' '完成,值得一杯咖啡。') ;;
+      sleep) MSGS=('zzz...夢到 slack 剛好為零的路徑...' 'zzz...數時脈邊緣中...') ;;
+      hungry) MSGS=('肚子餓了。來個通過的測試吧(或按 f)。') ;;
+      hello) MSGS=('嗨!ChipAgents 啟動了。來 tape-out 點東西吧。') ;;
+      bye) MSGS=('掰掰!我會幫你顧著這些 flop。') ;;
+      compact) MSGS=('哇,context 被壓縮了。我剛剛講到哪?') ;;
+      petted) MSGS=('呼嚕...(快樂的 clock tree 的聲音)' '謝謝!<3') ;;
+      fed) MSGS=('嚼嚼。好吃的 bit。') ;;
+      egg) MSGS=('一顆蛋。裡面有東西在長...累積經驗就會孵化。' 'ChipAgents 工作時,蛋會晃動。') ;;
+      hatch) MSGS=('我孵出來了!Hello world。') ;;
+      levelup) MSGS=('升級了!我的 fan-out 變大了。') ;;
+    esac
+  else
+    case $m in
+      idle) MSGS=('Waiting for orders. Clocks idle, power low.' 'Got any RTL for me?' 'No timing violations in here.' "I'm clock-gated until you need me." 'Fun fact: a latch is a flop that never learned to wait.' 'Reset asserted. Ready when you are.') ;;
+      think) MSGS=('Thinking... propagating through the combinational cloud.' 'Hmm. Let me trace that signal.' 'Reading the spec between the lines.' 'Planning the next step.') ;;
+      sub) MSGS=("A subagent is out on a mission. I'm keeping an eye on it." 'Divide and conquer. Waiting for the reports.') ;;
+      work) MSGS=('Editing. Non-blocking assignments only, I promise.' 'Typing at 1 GHz.' 'Making changes. Please hold the reset.' '{prog} is busy.') ;;
+      read) MSGS=('Reading the code. Every line of it.' 'Grepping for clues.' "So that's where the reset goes.") ;;
+      sim) MSGS=('{prog} is running. Watching the waveforms scroll by.' 'Simulating... time moves faster in there than out here.' 'Come on, UVM_ERROR : 0, come on...' 'Seeds are random, my hopes are deterministic.' 'Grab a coffee; simulators do not hurry.') ;;
+      wave) MSGS=('Opening waves. Zoom in, zoom out, zoom in.' 'Is that glitch real, or am I seeing things?') ;;
+      lint) MSGS=('Linting. Width mismatches, show yourselves.' '{prog} is reading every always block.' 'Hunting for inferred latches.') ;;
+      synth) MSGS=('Synthesizing. Turning ideas into gates.' '{prog} is mapping logic. NAND you are welcome.' 'Counting gates and hoping for slack.') ;;
+      formal) MSGS=('Formal is proving things. Or finding counterexamples.' "For all inputs... that's a lot of inputs.") ;;
+      git) MSGS=('Committing. A tidy history is a happy history.' 'git says hello.') ;;
+      pass) MSGS=("PASS! That's my favourite word." 'Clean run! A passing test is my favourite snack.' "All green. I'm doing a little dance.") ;;
+      fail) MSGS=('Uh oh. Read the first error, not the last.' "Red text! Don't panic; X happens." 'A failure is just a bug saying hello.' 'Check the reset and the seed first.') ;;
+      review) MSGS=('A reviewer is reading the diff. Fingers crossed.' 'Peer review in progress. Hide the TODOs.') ;;
+      done) MSGS=('Turn done! Your move.' 'Finished. Anything else to check?' 'Done. That deserves a coffee.') ;;
+      sleep) MSGS=('zzz... dreaming of zero-slack paths...' 'zzz... counting clock edges...') ;;
+      hungry) MSGS=("I'm hungry. A passing test would be nice (or press f).") ;;
+      hello) MSGS=("Hi! ChipAgents is up. Let's tape out something.") ;;
+      bye) MSGS=("Bye! I'll keep the flops warm.") ;;
+      compact) MSGS=('Whoa, the context just got compacted. Where was I?') ;;
+      petted) MSGS=("Purr... (that's a happy clock tree)" 'Thank you! <3') ;;
+      fed) MSGS=('Nom nom. Delicious bits.') ;;
+      egg) MSGS=('An egg. Something grows inside; it hatches with experience.' 'The egg wobbles while ChipAgents works.') ;;
+      hatch) MSGS=('I hatched! Hello, world.') ;;
+      levelup) MSGS=('Level up! My fan-out just grew.') ;;
+    esac
+  fi
+  ((${#MSGS[@]})) || MSGS=('...')
+}
+
+pick_msg() {
+  msg_pool "$1"
+  local m=${MSGS[RANDOM % ${#MSGS[@]}]}
+  m=${m//\{prog\}/${PROG:-it}}
+  MSG=$m
+}
+
+# ---------------------------------------------------------------- mood ---
+
+# The visual mood from the state and the time since the last event.
+decide_mood() {
+  local ev=${S[last_event]:-} ts xp fed age
+  num last_ts ts
+  num xp xp
+  num last_fed fed
+  age=$((NOW - ts))
+  PROG=${S[last_prog]:-}
+  if ((xp < HATCH_XP)); then
+    MOOD=egg
+    return
+  fi
+  MOOD=
+  case $ev in
+    hello) ((age < 8)) && MOOD=hello ;;
+    bye) ((age < 30)) && MOOD=bye ;;
+    think | turn) ((age < 180)) && MOOD=think ;;
+    tool)
+      if ((age < ${CHIP_PET_TOOL_TIMEOUT:-1800})); then
+        case ${S[last_kind]:-} in
+          sim | test) MOOD=sim ;;
+          lint | synth | formal | wave | git | read | sub) MOOD=${S[last_kind]} ;;
+          *) MOOD=work ;;
+        esac
+      fi
+      ;;
+    pass) ((age < 10)) && MOOD=pass ;;
+    fail) ((age < 20)) && MOOD=fail ;;
+    done) ((age < 15)) && MOOD=done ;;
+    review) ((age < 120)) && MOOD=review ;;
+    compact) ((age < 10)) && MOOD=compact ;;
+    petted) ((age < 6)) && MOOD=petted ;;
+    fed) ((age < 6)) && MOOD=fed ;;
+  esac
+  [[ -n $MOOD ]] && return
+  if ((age > ${CHIP_PET_SLEEP_AFTER:-600})); then
+    MOOD=sleep
+  elif ((NOW - fed > ${CHIP_PET_HUNGRY_AFTER:-28800})); then
+    MOOD=hungry
+  else
+    MOOD=idle
+  fi
+}
+
+# ---------------------------------------------------------------- render ---
+
+C_ON= WRAP_KEY=
+color_init() {
+  C_ON=
+  [[ -t 1 && -z ${NO_COLOR:-} ]] && C_ON=1
+}
+
+# Paint $2 with SGR code $1 into $3 (no-op without colour).
+paint() {
+  if [[ -n $C_ON ]]; then
+    printf -v "$3" '\e[%sm%s\e[0m' "$1" "$2"
+  else
+    printf -v "$3" '%s' "$2"
+  fi
+}
+
+# Build the frame for mood $1, tick $2 and width $3 into OUT.
+render() {
+  local mood=$1 t=$2 width=$3 xp i line art_w=0 w
+  OUT=()
+  num xp xp
+  level_of "$xp"
+  set_species "${S[species]:-chip}"
+  local dot=' - '
+  utf8 && dot=' · '
+
+  local head="${S[name]:-pet} the ${S[species]:-chip}${dot}Lv $LEVEL${dot}$STAGE"
+  paint "1;$COLOR" "$head" line
+  OUT+=("$line")
+
+  # Speech bubble.
+  local inner=$((width - 4))
+  ((inner > 44)) && inner=44
+  ((inner < 12)) && inner=12
+  if [[ $WRAP_KEY != "$inner:$MSG" ]]; then
+    wrap_text "$MSG" "$inner"
+    WRAP_KEY=$inner:$MSG
+  fi
+  local bw=0
+  for line in "${WRAP[@]}"; do
+    str_width "$line" w
+    ((w > bw)) && bw=$w
+  done
+  local bar
+  printf -v bar '%*s' "$((bw + 1))" ''
+  OUT+=(" .${bar// /-}.")
+  for line in "${WRAP[@]}"; do
+    pad_to "$line" "$bw" line
+    OUT+=("( $line )")
+  done
+  OUT+=(" '${bar// /-}'")
+  OUT+=('     \')
+
+  # Pet and props side by side.
+  pet_art "$mood" "$t"
+  props "$mood" "$t"
+  for line in "${A[@]}"; do
+    str_width "$line" w
+    ((w > art_w)) && art_w=$w
+  done
+  ((art_w < 12)) && art_w=12
+  local pc=36
+  case $mood in
+    fail) pc=31 ;;
+    pass | done | hatch | levelup | petted) pc=32 ;;
+    sleep) pc=2 ;;
+  esac
+  for i in 0 1 2 3; do
+    local a p
+    pad_to "${A[i]}" "$((art_w + 2))" a
+    paint "$COLOR" "$a" a
+    p=${P[i]}
+    local room=$((width - art_w - 2))
+    ((room < 0)) && room=0
+    p=${p:0:room}
+    paint "$pc" "$p" p
+    OUT+=("$a$p")
+  done
+
+  # Stats.
+  local tools turns sims passes fails filled=0 span=10 meter
+  num tools tools
+  num turns turns
+  num sims sims
+  num passes passes
+  num fails fails
+  if [[ $STAGE == egg ]]; then
+    filled=$((xp * span / HATCH_XP))
+  elif ((LV_NEXT > LV_BASE)); then
+    filled=$(((xp - LV_BASE) * span / (LV_NEXT - LV_BASE)))
+  fi
+  printf -v meter '%*s' "$filled" ''
+  meter=${meter// /#}
+  printf -v meter '[%-*s]' "$span" "$meter"
+  local ok=ok ng=fail
+  utf8 && ok=✓ ng=✗
+  OUT+=('')
+  if [[ $STAGE == egg ]]; then
+    OUT+=("$meter $xp/$HATCH_XP xp to hatch")
+  else
+    OUT+=("$meter $xp/$LV_NEXT xp")
+  fi
+  OUT+=("turns $turns${dot}tools $tools${dot}sims $sims")
+  local tail="$ok $passes  $ng $fails"
+  [[ -n ${S[project]:-} ]] && tail+="${dot}${S[project]}"
+  OUT+=("$tail")
+}
+
+# ------------------------------------------------------------- commands ---
+
+term_size() {
+  local s
+  s=$(stty size < /dev/tty 2> /dev/null) || s=
+  ROWS=${s% *} COLS=${s#* }
+  [[ $COLS =~ ^[0-9]+$ ]] || COLS=${COLUMNS:-40}
+  [[ $ROWS =~ ^[0-9]+$ ]] || ROWS=${LINES:-20}
+}
+
+cmd_watch() {
+  local fps=${CHIP_PET_FPS:-4} delay t=0 key last_mood= msg_at=0 seen_done= prev_level= prev_stage=
+  [[ $fps =~ ^[1-9][0-9]*$ ]] || fps=4
+  delay=$((1000 / fps))
+  printf -v delay '0.%03d' "$delay"
+  ((fps == 1)) && delay=1
+  color_init
+  term_size
+  trap term_size WINCH
+  trap 'printf "\e[?25h\e[?7h\e[0m\n"; exit 0' INT TERM HUP
+  # Title (lets "chip-pet event startup" find this pane), hide the cursor,
+  # and turn auto-wrap off so a narrow pane clips lines instead of scrolling.
+  printf '\e]2;chip-pet\e\\\e[?25l\e[?7l\e[2J'
+  local override= override_until=0
+  while :; do
+    now_s NOW
+    # No lock: save_state replaces the file atomically.
+    load_state
+    ensure_pet
+    local xp dones
+    num xp xp
+    num dones dones
+    level_of "$xp"
+
+    # One-shot celebrations the state file does not carry.
+    if [[ -n $prev_stage && $prev_stage == egg && $STAGE != egg ]]; then
+      override=hatch override_until=$((NOW + 6))
+    elif [[ -n $prev_level && $LEVEL -gt $prev_level && $STAGE != egg ]]; then
+      override=levelup override_until=$((NOW + 6))
+    fi
+    prev_level=$LEVEL prev_stage=$STAGE
+    if [[ -n ${CHIP_PET_BELL:-} && -n $seen_done && $dones -gt $seen_done ]]; then
+      printf '\a'
+    fi
+    seen_done=$dones
+
+    decide_mood
+    ((NOW < override_until)) && MOOD=$override
+    if [[ $MOOD != "$last_mood" ]] || ((NOW - msg_at >= 12)); then
+      pick_msg "$MOOD"
+      last_mood=$MOOD msg_at=$NOW
+    fi
+    render "$MOOD" "$t" "$COLS"
+    local frame= i
+    for ((i = 0; i < ${#OUT[@]} && i < ROWS; i++)); do
+      frame+="${OUT[i]}"$'\e[K\n'
+    done
+    if ((ROWS > ${#OUT[@]} + 1)); then
+      frame+=$'\e[2m'"p pet  f feed  q quit"$'\e[0m\e[K'
+    fi
+    printf '\e[H%s\e[J' "$frame"
+
+    if [[ -t 0 ]]; then
+      if read -rsn1 -t "$delay" key; then
+        case $key in
+          p) with_lock apply_event pet ;;
+          f) with_lock apply_event feed ;;
+          q) break ;;
+        esac
+      fi
+    else
+      sleep "$delay"
+    fi
+    ((t++))
+  done
+  printf '\e[?25h\e[?7h\e[0m\n'
+}
+
+cmd_card() {
+  now_s NOW
+  load_state
+  ensure_pet
+  color_init
+  local xp
+  num xp xp
+  level_of "$xp"
+  decide_mood
+  pick_msg "$MOOD"
+  render "$MOOD" 5 "${COLUMNS:-60}"
+  printf '%s\n' "${OUT[@]}"
+}
+
+# For the /pet command: plain text, an action then the card.
+cmd_slash() {
+  local sub=${1:-show}
+  shift || true
+  case $sub in
+    show | card | stats | '') ;;
+    pet) with_lock apply_event pet ;;
+    feed) with_lock apply_event feed ;;
+    name | rename) cmd_rename "$*" > /dev/null || return 1 ;;
+    adopt) cmd_adopt "$@" > /dev/null || return 1 ;;
+    help) usage; return 0 ;;
+    *) echo "unknown /pet argument: $sub (try: show, pet, feed, name <name>, adopt <species>)"; return 1 ;;
+  esac
+  NO_COLOR=1 cmd_card
+}
+
+cmd_rename() {
+  local name
+  name=$(clean_name "$*")
+  [[ -n ${name// /} ]] || { echo "usage: chip-pet rename <name>" >&2; return 1; }
+  with_lock _rename "$name"
+  echo "Your pet is now called $name."
+}
+_rename() {
+  load_state
+  ensure_pet
+  S[name]=$1
+  save_state
+}
+
+cmd_adopt() {
+  local sp=${1:-} name=${2:-}
+  if [[ -z $sp || $sp == --list || $sp == list ]]; then
+    local s i
+    color_init
+    for s in "${SPECIES[@]}"; do
+      set_species "$s"
+      printf '%s (%s)\n' "$s" "$DEFNAME"
+      for i in 0 1 2 3; do
+        local line=${ART[i]//\{L\}/o}
+        line=${line//\{R\}/o}
+        printf '  %s\n' "${line//\{M\}/_}"
+      done
+    done
+    echo
+    echo "chip-pet adopt <species> [name]   (xp and stats are kept)"
+    return 0
+  fi
+  is_species "$sp" || { echo "unknown species: $sp (one of: ${SPECIES[*]})" >&2; return 1; }
+  name=$(clean_name "$name")
+  with_lock _adopt "$sp" "$name"
+  echo "Adopted a $sp${name:+ called $name}."
+}
+_adopt() {
+  load_state
+  ensure_pet
+  set_species "$1"
+  S[species]=$1
+  S[name]=${2:-$DEFNAME}
+  save_state
+}
+
+cmd_reset() {
+  rm -f "$STATE" "$PET_HOME/plugin_root"
+  echo "chip-pet state removed ($STATE)."
+}
+
+cmd_tmux() {
+  [[ -n ${TMUX:-} ]] || {
+    echo "Not inside tmux. Run 'chip-pet watch' in another terminal, e.g.:" >&2
+    echo "  xterm -geometry 44x16 -e bash '$SELF' watch &" >&2
+    return 1
+  }
+  local width=${1:-${CHIP_PET_PANE_WIDTH:-40}}
+  tmux split-window -d -h -l "$width" "bash '$SELF' watch"
+}
+
+# Preview every mood without ChipAgents. --once prints one frame per mood.
+cmd_demo() {
+  local once= m t
+  [[ ${1:-} == --once ]] && once=1
+  local moods=(egg hatch hello think read work sim lint synth formal wave git pass fail review sub compact petted fed done hungry sleep bye levelup)
+  load_state
+  ensure_pet
+  [[ ${S[xp]:-0} =~ ^[0-9]+$ ]] && ((S[xp] >= HATCH_XP)) || S[xp]=120
+  color_init
+  [[ -n $once ]] || term_size
+  for m in "${moods[@]}"; do
+    now_s NOW
+    case $m in
+      lint) PROG=slang ;;
+      synth) PROG=dc_shell ;;
+      formal) PROG=jg ;;
+      wave) PROG=verdi ;;
+      git) PROG=git ;;
+      *) PROG=xrun ;;
+    esac
+    pick_msg "$m"
+    if [[ -n $once ]]; then
+      local saved=${S[xp]}
+      [[ $m == egg ]] && S[xp]=10
+      echo "=== $m"
+      render "$m" 5 60
+      printf '%s\n' "${OUT[@]}"
+      S[xp]=$saved
+      continue
+    fi
+    for ((t = 0; t < 10; t++)); do
+      local saved=${S[xp]}
+      [[ $m == egg ]] && S[xp]=10
+      render "$m" "$t" "${COLS:-60}"
+      S[xp]=$saved
+      printf '\e[H\e[2J%s\n' "[demo: $m]"
+      printf '%s\n' "${OUT[@]}"
+      sleep 0.25
+    done
+  done
+}
+
+usage() {
+  cat << EOF
+chip-pet $CHIP_PET_VERSION: a terminal pet that watches ChipAgents work.
+
+  chip-pet watch            animate the pet (run it in a tmux pane or a 2nd terminal)
+  chip-pet tmux [width]     open 'watch' in a tmux side pane
+  chip-pet card             print the pet and its stats once
+  chip-pet pet | feed       interact with it (also: p and f keys in 'watch')
+  chip-pet rename <name>    rename it
+  chip-pet adopt [species] [name]
+                            list the species, or switch to another one
+  chip-pet demo [--once]    preview every animation without ChipAgents
+  chip-pet reset            forget the pet
+  chip-pet event <name>     used by the ChipAgents hooks (silent, always exit 0)
+
+State: $PET_HOME
+Environment: CHIP_PET_HOME, CHIP_PET_LANG=zh-TW, CHIP_PET_BELL=1, CHIP_PET_TMUX=1,
+CHIP_PET_FPS, CHIP_PET_SLEEP_AFTER, CHIP_PET_ASCII=1, NO_COLOR, CHIP_PET_OFF=1.
+EOF
+}
+
+main() {
+  local cmd=${1:-help}
+  shift || true
+  case $cmd in
+    event)
+      # Hooks must never disturb the agent: no output and exit 0, whatever
+      # happens. The subshell contains even a bug that kills the shell.
+      (
+        set +u
+        cmd_event "$@"
+      ) > /dev/null 2>&1
+      exit 0
+      ;;
+    watch) cmd_watch "$@" ;;
+    tmux) cmd_tmux "$@" ;;
+    card | show) cmd_card ;;
+    slash) cmd_slash "$@" ;;
+    pet) with_lock apply_event pet && echo "${S[name]:-Your pet} is happy." ;;
+    feed) with_lock apply_event feed && echo "${S[name]:-Your pet} munches some bits." ;;
+    rename | name) cmd_rename "$@" ;;
+    adopt) cmd_adopt "$@" ;;
+    demo) cmd_demo "$@" ;;
+    reset) cmd_reset ;;
+    version | --version) echo "chip-pet $CHIP_PET_VERSION" ;;
+    help | -h | --help) usage ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"
